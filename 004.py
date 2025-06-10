@@ -1,689 +1,820 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, filedialog
-import sqlite3
-import hashlib
-import datetime
 import os
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-import openpyxl
+import shutil
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
+from hashlib import sha256
+from tkinter import *
+from tkinter import ttk, messagebox, simpledialog, filedialog
+from fpdf import FPDF
 
-DB_FILE = 'finanzas.db'
+# ----------------------------------------------
+# CONFIGURACIÓN
+DB_NAME = "finanzas.db"
+BACKUP_FOLDER = "backups"
+APP_VERSION = "1.0.0"
+VERSION_CHECK_FILE = "version.txt"  # archivo local o remoto para actualización automática (ejemplo básico)
 
-# ---------------------------------------
-# --- BASE DE DATOS ---------------------
-# ---------------------------------------
+# ----------------------------------------------
+# BASE DE DATOS - CONEXIÓN Y CREACIÓN DE TABLAS
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute('PRAGMA foreign_keys = ON')
-    return conn
+class DB:
+    _conn = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def connect(cls):
+        if cls._conn is None:
+            cls._conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+            cls._conn.row_factory = sqlite3.Row
+        return cls._conn
+
+    @classmethod
+    def execute(cls, sql, params=()):
+        with cls._lock:
+            c = cls.connect().cursor()
+            c.execute(sql, params)
+            cls.connect().commit()
+            return c
+
+    @classmethod
+    def query(cls, sql, params=()):
+        with cls._lock:
+            c = cls.connect().cursor()
+            c.execute(sql, params)
+            return c.fetchall()
+
+    @classmethod
+    def close(cls):
+        if cls._conn:
+            cls._conn.close()
+            cls._conn = None
+
 
 def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL,
+        apellido TEXT NOT NULL,
+        cedula TEXT NOT NULL UNIQUE,
+        username TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL,
+        tipo TEXT NOT NULL CHECK(tipo IN ('master','estandar'))
+    )
+    """)
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS transacciones (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario TEXT NOT NULL,
+        tipo TEXT NOT NULL CHECK(tipo IN ('entrada','salida')),
+        monto REAL NOT NULL,
+        moneda TEXT NOT NULL CHECK(moneda IN ('Bs','USD')),
+        medio TEXT NOT NULL CHECK(medio IN ('fisico','digital')),
+        banco_ven REAL DEFAULT 0,
+        banco_mercantil REAL DEFAULT 0,
+        banco_banesco REAL DEFAULT 0,
+        descripcion TEXT,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS cuentas_por_cobrar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cliente TEXT NOT NULL,
+        monto REAL NOT NULL,
+        moneda TEXT NOT NULL CHECK(moneda IN ('Bs','USD')),
+        fecha_vencimiento DATE NOT NULL,
+        estado TEXT NOT NULL CHECK(estado IN ('pendiente','pagada','vencida')) DEFAULT 'pendiente',
+        descripcion TEXT,
+        fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS cuentas_por_pagar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        proveedor TEXT NOT NULL,
+        monto REAL NOT NULL,
+        moneda TEXT NOT NULL CHECK(moneda IN ('Bs','USD')),
+        fecha_vencimiento DATE NOT NULL,
+        estado TEXT NOT NULL CHECK(estado IN ('pendiente','pagada','vencida')) DEFAULT 'pendiente',
+        descripcion TEXT,
+        fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS historial_cambios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario TEXT NOT NULL,
+        accion TEXT NOT NULL,
+        tabla TEXT NOT NULL,
+        registro_id INTEGER NOT NULL,
+        descripcion TEXT,
+        fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
-    # Tabla usuarios
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL,
-            apellido TEXT NOT NULL,
-            cedula TEXT NOT NULL UNIQUE,
-            username TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL,
-            tipo TEXT NOT NULL CHECK(tipo IN ('master', 'estandar'))
-        )
-    ''')
+init_db()
 
-    # Tabla transacciones
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS transacciones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha TEXT NOT NULL,
-            hora TEXT NOT NULL,
-            usuario_id INTEGER NOT NULL,
-            tipo_mov TEXT NOT NULL CHECK(tipo_mov IN ('entrada', 'salida')),
-            categoria TEXT NOT NULL,
-            descripcion TEXT,
-            moneda TEXT NOT NULL CHECK(moneda IN ('bs', 'usd')),
-            monto REAL NOT NULL,
-            FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
+# ----------------------------------------------
+# UTILIDADES
 
 def hash_password(password):
-    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+    return sha256(password.encode('utf-8')).hexdigest()
 
-def check_first_user_exists():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM usuarios')
-    exists = c.fetchone()[0] > 0
-    conn.close()
-    return exists
+def check_password(password, hashed):
+    return hash_password(password) == hashed
 
-def crear_usuario(nombre, apellido, cedula, username, password, tipo):
-    conn = get_db_connection()
-    c = conn.cursor()
+def backup_database():
+    if not os.path.exists(BACKUP_FOLDER):
+        os.makedirs(BACKUP_FOLDER)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_name = f"backup_{timestamp}.db"
+    src = DB_NAME
+    dst = os.path.join(BACKUP_FOLDER, backup_name)
     try:
-        c.execute('INSERT INTO usuarios (nombre, apellido, cedula, username, password, tipo) VALUES (?, ?, ?, ?, ?, ?)',
-                  (nombre, apellido, cedula, username, hash_password(password), tipo))
-        conn.commit()
-        return True, None
-    except sqlite3.IntegrityError as e:
+        shutil.copy2(src, dst)
+        return True, dst
+    except Exception as e:
         return False, str(e)
-    finally:
-        conn.close()
 
-def validar_login(username, password):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT id, nombre, apellido, tipo, password FROM usuarios WHERE username = ?', (username,))
-    row = c.fetchone()
-    conn.close()
-    if row and hash_password(password) == row[4]:
-        return {
-            'id': row[0],
-            'nombre': row[1],
-            'apellido': row[2],
-            'tipo': row[3],
-            'username': username
-        }
-    else:
-        return None
+def log_change(usuario, accion, tabla, registro_id, descripcion=None):
+    DB.execute("""
+    INSERT INTO historial_cambios (usuario, accion, tabla, registro_id, descripcion)
+    VALUES (?, ?, ?, ?, ?)
+    """, (usuario, accion, tabla, registro_id, descripcion))
 
-# ---------------------------------------
-# --- FUNCIONES DE TRANSACCIONES --------
-# ---------------------------------------
+def get_user(username):
+    rows = DB.query("SELECT * FROM usuarios WHERE username = ?", (username,))
+    return rows[0] if rows else None
 
-def registrar_transaccion(usuario_id, tipo_mov, categoria, descripcion, moneda, monto):
-    now = datetime.datetime.now()
-    fecha = now.strftime('%Y-%m-%d')
-    hora = now.strftime('%H:%M:%S')
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO transacciones (fecha, hora, usuario_id, tipo_mov, categoria, descripcion, moneda, monto)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (fecha, hora, usuario_id, tipo_mov, categoria, descripcion, moneda, monto))
-    conn.commit()
-    conn.close()
+# ----------------------------------------------
+# REPORTES PDF
 
-def obtener_transacciones(filtros=None):
-    # filtros es dict con claves: fecha_inicio, fecha_fin, usuario_id, tipo_mov, categoria, moneda, texto_busqueda
-    conn = get_db_connection()
-    c = conn.cursor()
-    query = 'SELECT t.id, t.fecha, t.hora, u.username, t.tipo_mov, t.categoria, t.descripcion, t.moneda, t.monto FROM transacciones t JOIN usuarios u ON t.usuario_id = u.id WHERE 1=1'
-    params = []
+class PDFReport(FPDF):
+    def header(self):
+        self.set_font("Arial", 'B', 12)
+        self.cell(0, 10, "Reporte Financiero", border=0, ln=1, align='C')
+        self.ln(5)
 
-    if filtros:
-        if 'fecha_inicio' in filtros and filtros['fecha_inicio']:
-            query += ' AND fecha >= ?'
-            params.append(filtros['fecha_inicio'])
-        if 'fecha_fin' in filtros and filtros['fecha_fin']:
-            query += ' AND fecha <= ?'
-            params.append(filtros['fecha_fin'])
-        if 'usuario_id' in filtros and filtros['usuario_id']:
-            query += ' AND usuario_id = ?'
-            params.append(filtros['usuario_id'])
-        if 'tipo_mov' in filtros and filtros['tipo_mov'] in ('entrada', 'salida'):
-            query += ' AND tipo_mov = ?'
-            params.append(filtros['tipo_mov'])
-        if 'categoria' in filtros and filtros['categoria']:
-            query += ' AND categoria LIKE ?'
-            params.append('%' + filtros['categoria'] + '%')
-        if 'moneda' in filtros and filtros['moneda'] in ('bs', 'usd'):
-            query += ' AND moneda = ?'
-            params.append(filtros['moneda'])
-        if 'texto' in filtros and filtros['texto']:
-            query += ' AND (descripcion LIKE ? OR categoria LIKE ?)'
-            params.extend(['%' + filtros['texto'] + '%', '%' + filtros['texto'] + '%'])
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Arial", 'I', 8)
+        self.cell(0, 10, f"Página {self.page_no()}", 0, 0, 'C')
 
-    query += ' ORDER BY fecha DESC, hora DESC'
-    c.execute(query, params)
-    resultados = c.fetchall()
-    conn.close()
-    return resultados
+def generate_pdf_report(username, filename="reporte_financiero.pdf"):
+    pdf = PDFReport()
+    pdf.add_page()
+    pdf.set_font("Arial", '', 11)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pdf.cell(0, 10, f"Usuario: {username}", ln=1)
+    pdf.cell(0, 10, f"Fecha y hora: {now}", ln=1)
+    pdf.ln(5)
 
-def calcular_balance(usuario_id=None):
-    conn = get_db_connection()
-    c = conn.cursor()
-    if usuario_id:
-        c.execute('SELECT moneda, SUM(CASE WHEN tipo_mov="entrada" THEN monto ELSE -monto END) FROM transacciones WHERE usuario_id=? GROUP BY moneda', (usuario_id,))
-    else:
-        c.execute('SELECT moneda, SUM(CASE WHEN tipo_mov="entrada" THEN monto ELSE -monto END) FROM transacciones GROUP BY moneda')
-    rows = c.fetchall()
-    conn.close()
-    balances = {row[0]: row[1] if row[1] is not None else 0 for row in rows}
-    # asegurar que estén ambos monedas
-    if 'bs' not in balances: balances['bs'] = 0
-    if 'usd' not in balances: balances['usd'] = 0
-    return balances
+    # Resumen transacciones
+    entradas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada'")
+    salidas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida'")
 
-# ---------------------------------------
-# --- REPORTES PDF ----------------------
-# ---------------------------------------
+    total_entrada = entradas[0]["total"] or 0
+    total_salida = salidas[0]["total"] or 0
+    balance = total_entrada - total_salida
 
-def generar_reporte_pdf(ruta_pdf, transacciones, usuario_actual):
-    c = canvas.Canvas(ruta_pdf, pagesize=letter)
-    width, height = letter
-    margen = 50
-    y = height - margen
+    pdf.cell(0, 10, f"Total Entradas: {total_entrada:.2f}", ln=1)
+    pdf.cell(0, 10, f"Total Salidas: {total_salida:.2f}", ln=1)
+    pdf.cell(0, 10, f"Balance Neto: {balance:.2f}", ln=1)
+    pdf.ln(10)
 
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(margen, y, "Reporte de Transacciones")
-    y -= 25
-    c.setFont("Helvetica", 10)
-    c.drawString(margen, y, f"Generado por: {usuario_actual['nombre']} {usuario_actual['apellido']} ({usuario_actual['username']})")
-    y -= 15
-    c.drawString(margen, y, f"Fecha generación: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    y -= 25
+    # Cuentas por cobrar
+    pdf.cell(0, 10, "Cuentas por Cobrar:", ln=1)
+    cxc = DB.query("SELECT * FROM cuentas_por_cobrar ORDER BY fecha_vencimiento")
+    for c in cxc:
+        pdf.cell(0, 8, f"{c['cliente']} - {c['monto']} {c['moneda']} - Vence: {c['fecha_vencimiento']} - Estado: {c['estado']}", ln=1)
 
-    c.setFont("Helvetica-Bold", 9)
-    encabezados = ["ID", "Fecha", "Hora", "Usuario", "Tipo", "Categoría", "Descripción", "Moneda", "Monto"]
-    posiciones = [margen, margen+30, margen+85, margen+140, margen+210, margen+270, margen+350, margen+450, margen+490]
-    for i, encabezado in enumerate(encabezados):
-        c.drawString(posiciones[i], y, encabezado)
-    y -= 15
-    c.setFont("Helvetica", 8)
+    pdf.ln(5)
+    # Cuentas por pagar
+    pdf.cell(0, 10, "Cuentas por Pagar:", ln=1)
+    cxp = DB.query("SELECT * FROM cuentas_por_pagar ORDER BY fecha_vencimiento")
+    for c in cxp:
+        pdf.cell(0, 8, f"{c['proveedor']} - {c['monto']} {c['moneda']} - Vence: {c['fecha_vencimiento']} - Estado: {c['estado']}", ln=1)
 
-    for t in transacciones:
-        if y < 50:
-            c.showPage()
-            y = height - margen
-            c.setFont("Helvetica-Bold", 9)
-            for i, encabezado in enumerate(encabezados):
-                c.drawString(posiciones[i], y, encabezado)
-            y -= 15
-            c.setFont("Helvetica", 8)
-        # Datos
-        c.drawString(posiciones[0], y, str(t[0]))
-        c.drawString(posiciones[1], y, t[1])
-        c.drawString(posiciones[2], y, t[2])
-        c.drawString(posiciones[3], y, t[3])
-        c.drawString(posiciones[4], y, t[4])
-        c.drawString(posiciones[5], y, t[5])
-        desc = t[6] if t[6] else ""
-        c.drawString(posiciones[6], y, desc[:18])
-        c.drawString(posiciones[7], y, t[7])
-        c.drawRightString(posiciones[8]+40, y, f"{t[8]:,.2f}")
-        y -= 12
+    pdf.output(filename)
+    return filename
 
-    c.save()
+# ----------------------------------------------
+# INTERFAZ GRÁFICA
 
-# ---------------------------------------
-# --- IMPORTAR/EXPORTAR EXCEL -----------
-# ---------------------------------------
-
-def exportar_a_excel(ruta_excel, transacciones):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    if ws:
-        ws.title = "Transacciones"
-        encabezados = ["ID", "Fecha", "Hora", "Usuario", "Tipo", "Categoría", "Descripción", "Moneda", "Monto"]
-        ws.append(encabezados)
-        for t in transacciones:
-            ws.append(t)
-        wb.save(ruta_excel)
-
-def importar_desde_excel(ruta_excel):
-    wb = openpyxl.load_workbook(ruta_excel)
-    ws = wb.active
-    if ws:
-        filas = list(ws.iter_rows(min_row=2, values_only=True))
-        # Se espera que las columnas sean las mismas que exportar
-        # Ignoramos ID porque es autoincremental
-        transacciones = []
-        for fila in filas:
-            try:
-                fecha, hora, usuario_username, tipo_mov, categoria, descripcion, moneda, monto = (
-                    fila[1], fila[2], fila[3], fila[4], fila[5], fila[6], fila[7], fila[8])
-                transacciones.append({
-                    'fecha': fecha,
-                    'hora': hora,
-                    'usuario_username': usuario_username,
-                    'tipo_mov': tipo_mov,
-                    'categoria': categoria,
-                    'descripcion': descripcion,
-                    'moneda': moneda,
-                    'monto': monto
-                })
-            except Exception:
-                continue
-        return transacciones
-
-def insertar_transacciones_importadas(transacciones):
-    conn = get_db_connection()
-    c = conn.cursor()
-    for t in transacciones:
-        # Buscar usuario_id por username
-        c.execute('SELECT id FROM usuarios WHERE username = ?', (t['usuario_username'],))
-        usuario = c.fetchone()
-        if usuario:
-            usuario_id = usuario[0]
-            try:
-                c.execute('''
-                    INSERT INTO transacciones (fecha, hora, usuario_id, tipo_mov, categoria, descripcion, moneda, monto)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (t['fecha'], t['hora'], usuario_id, t['tipo_mov'], t['categoria'], t['descripcion'], t['moneda'], t['monto']))
-            except Exception:
-                continue
-    conn.commit()
-    conn.close()
-
-# ---------------------------------------
-# --- INTERFAZ GRÁFICA ------------------
-# ---------------------------------------
-
-class Aplicacion(tk.Tk):
+class App(Tk):
     def __init__(self):
         super().__init__()
-        self.title("Sistema Financiero")
-        self.geometry("1000x600")
-        self.resizable(False, False)
+        self.title("Sistema Financiero Completo - v" + APP_VERSION)
+        self.geometry("900x650")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.current_user = None
+        self.create_login_screen()
+        self.backup_on_startup()
+        self.after(60 * 60 * 1000, self.backup_periodic)  # backup cada hora
 
-        self.usuario_actual = None
-
-        # Inicializar DB
-        init_db()
-
-        # Si no hay usuarios, obligar crear primero master
-        if not check_first_user_exists():
-            self.ventana_registro_usuario(master_creation=True)
+    def backup_on_startup(self):
+        success, msg = backup_database()
+        if success:
+            print(f"Backup realizado al iniciar: {msg}")
         else:
-            self.ventana_login()
+            print(f"Error backup al iniciar: {msg}")
 
-    # ---------------------------
-    # VENTANA LOGIN
-    # ---------------------------
-    def ventana_login(self):
-        self.limpiar_ventana()
-
-        frame = ttk.Frame(self, padding=20)
-        frame.pack(expand=True)
-
-        ttk.Label(frame, text="INICIO DE SESIÓN", font=("Helvetica", 16)).grid(row=0, column=0, columnspan=2, pady=10)
-
-        ttk.Label(frame, text="Usuario:").grid(row=1, column=0, sticky=tk.E, pady=5)
-        self.entry_username = ttk.Entry(frame)
-        self.entry_username.grid(row=1, column=1, pady=5)
-
-        ttk.Label(frame, text="Contraseña:").grid(row=2, column=0, sticky=tk.E, pady=5)
-        self.entry_password = ttk.Entry(frame, show="*")
-        self.entry_password.grid(row=2, column=1, pady=5)
-
-        btn_login = ttk.Button(frame, text="Iniciar sesión", command=self.login)
-        btn_login.grid(row=3, column=0, columnspan=2, pady=10)
-
-        btn_registro = ttk.Button(frame, text="Registrarse", command=lambda: self.ventana_registro_usuario(solo_estandar=True))
-        btn_registro.grid(row=4, column=0, columnspan=2)
-
-    def login(self):
-        username = self.entry_username.get().strip()
-        password = self.entry_password.get().strip()
-
-        if not username or not password:
-            messagebox.showerror("Error", "Debe ingresar usuario y contraseña")
-            return
-
-        usuario = validar_login(username, password)
-        if usuario:
-            self.usuario_actual = usuario
-            self.ventana_principal()
+    def backup_periodic(self):
+        success, msg = backup_database()
+        if success:
+            print(f"Backup periódico realizado: {msg}")
         else:
-            messagebox.showerror("Error", "Usuario o contraseña incorrectos")
+            print(f"Error backup periódico: {msg}")
+        self.after(60 * 60 * 1000, self.backup_periodic)
 
-    # ---------------------------
-    # VENTANA REGISTRO USUARIO
-    # ---------------------------
-
-    def ventana_registro_usuario(self, master_creation=False, solo_estandar=False):
-        self.limpiar_ventana()
-        frame = ttk.Frame(self, padding=20)
-        frame.pack(expand=True)
-
-        # Título
-        if master_creation:
-            ttk.Label(frame, text="CREAR USUARIO MASTER (ADMINISTRADOR)", font=("Helvetica", 16)).grid(row=0, column=0, columnspan=2, pady=10)
-        elif solo_estandar:
-            ttk.Label(frame, text="REGISTRAR USUARIO", font=("Helvetica", 16)).grid(row=0, column=0, columnspan=2, pady=10)
+    def on_close(self):
+        # Backup al cerrar app
+        success, msg = backup_database()
+        if success:
+            print(f"Backup realizado al cerrar: {msg}")
         else:
-            ttk.Label(frame, text="REGISTRAR NUEVO USUARIO", font=("Helvetica", 16)).grid(row=0, column=0, columnspan=2, pady=10)
+            print(f"Error backup al cerrar: {msg}")
+        self.destroy()
 
-        # Campos comunes
-        ttk.Label(frame, text="Nombre:").grid(row=1, column=0, sticky=tk.E, pady=5)
-        entry_nombre = ttk.Entry(frame)
-        entry_nombre.grid(row=1, column=1, pady=5)
-
-        ttk.Label(frame, text="Apellido:").grid(row=2, column=0, sticky=tk.E, pady=5)
-        entry_apellido = ttk.Entry(frame)
-        entry_apellido.grid(row=2, column=1, pady=5)
-
-        ttk.Label(frame, text="Cédula:").grid(row=3, column=0, sticky=tk.E, pady=5)
-        entry_cedula = ttk.Entry(frame)
-        entry_cedula.grid(row=3, column=1, pady=5)
-
-        ttk.Label(frame, text="Usuario (username):").grid(row=4, column=0, sticky=tk.E, pady=5)
-        entry_username = ttk.Entry(frame)
-        entry_username.grid(row=4, column=1, pady=5)
-
-        ttk.Label(frame, text="Contraseña:").grid(row=5, column=0, sticky=tk.E, pady=5)
-        entry_password = ttk.Entry(frame, show="*")
-        entry_password.grid(row=5, column=1, pady=5)
-
-        # Tipo de usuario
-        if master_creation:
-            tipo_usuario = 'master'
-            row_actual = 6
-        elif solo_estandar:
-            tipo_usuario = 'estandar'
-            row_actual = 6
-        else:
-            ttk.Label(frame, text="Tipo de usuario:").grid(row=6, column=0, sticky=tk.E, pady=5)
-            combo_tipo = ttk.Combobox(frame, state="readonly", values=["master", "estandar"])
-            combo_tipo.current(1)
-            combo_tipo.grid(row=6, column=1, pady=5)
-            row_actual = 7
-
-        # Función guardar
-        def guardar():
-            nombre = entry_nombre.get().strip()
-            apellido = entry_apellido.get().strip()
-            cedula = entry_cedula.get().strip()
-            username = entry_username.get().strip()
-            password = entry_password.get().strip()
-            tipo = tipo_usuario if master_creation or solo_estandar else combo_tipo.get()
-
-            if not nombre or not apellido or not cedula or not username or not password:
-                messagebox.showerror("Error", "Todos los campos son obligatorios")
-                return
-
-            exito, error = crear_usuario(nombre, apellido, cedula, username, password, tipo)
-            if exito:
-                messagebox.showinfo("Éxito", "Usuario creado correctamente")
-                if master_creation or solo_estandar:
-                    self.ventana_login()
-                else:
-                    self.ventana_principal()
-            else:
-                messagebox.showerror("Error", f"No se pudo crear usuario: {error}")
-
-        btn_guardar = ttk.Button(frame, text="Guardar", command=guardar)
-        btn_guardar.grid(row=row_actual, column=0, columnspan=2, pady=15)
-
-        # Botón cancelar si no es master_creation
-        if not master_creation:
-            comando_cancelar = self.ventana_login if solo_estandar else self.ventana_principal
-            btn_cancelar = ttk.Button(frame, text="Cancelar", command=comando_cancelar)
-            btn_cancelar.grid(row=row_actual + 1, column=0, columnspan=2)
-
-
-    # ---------------------------
-    # VENTANA PRINCIPAL CON PESTAÑAS
-    # ---------------------------
-
-    def ventana_principal(self):
-        self.limpiar_ventana()
-        self.geometry("1000x600")
-
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
-
-        menu_usuario = tk.Menu(menubar, tearoff=0)
-        menu_usuario.add_command(label="Cerrar sesión", command=self.cerrar_sesion)
-        if self.usuario_actual is not None and self.usuario_actual['tipo'] == 'master':
-            menu_usuario.add_command(label="Registrar usuario", command=self.ventana_registro_usuario)
-            menu_usuario.add_separator()
-            menu_usuario.add_command(label="Importar Excel", command=self.importar_excel)
-            menu_usuario.add_command(label="Exportar Excel", command=self.exportar_excel)
-            menubar.add_cascade(label=f"Usuario: {self.usuario_actual['username']}", menu=menu_usuario)
-
-        tabControl = ttk.Notebook(self)
-        tabControl.pack(expand=1, fill="both")
-
-        # Pestaña para registrar transacciones
-        self.tab_registro = ttk.Frame(tabControl)
-        tabControl.add(self.tab_registro, text='Registrar Transacción')
-
-        # Pestaña para ver transacciones
-        self.tab_ver = ttk.Frame(tabControl)
-        tabControl.add(self.tab_ver, text='Ver Transacciones')
-
-        # Pestaña para registrar capital (solo master)
-        if self.usuario_actual and self.usuario_actual['tipo'] == 'master':
-            self.tab_capital = ttk.Frame(tabControl)
-            tabControl.add(self.tab_capital, text='Capital')
-            self.construir_tab_capital()
-
-        # Pestaña reportes
-        self.tab_reportes = ttk.Frame(tabControl)
-        tabControl.add(self.tab_reportes, text='Reportes')
-
-        self.construir_tab_registro()
-        self.construir_tab_ver()
-        self.construir_tab_reportes()
-
-    def construir_tab_registro(self):
-        frame = self.tab_registro
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        ttk.Label(frame, text="Tipo de movimiento:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=10)
-        self.tipo_var = tk.StringVar(value="entrada")
-        ttk.Radiobutton(frame, text="Entrada", variable=self.tipo_var, value="entrada").grid(row=0, column=1)
-        ttk.Radiobutton(frame, text="Salida", variable=self.tipo_var, value="salida").grid(row=0, column=2)
-
-        ttk.Label(frame, text="Categoría:").grid(row=1, column=0, sticky=tk.W, padx=10)
-        self.entry_categoria = ttk.Entry(frame)
-        self.entry_categoria.grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=10)
-
-        ttk.Label(frame, text="Descripción:").grid(row=2, column=0, sticky=tk.W, padx=10)
-        self.entry_descripcion = ttk.Entry(frame)
-        self.entry_descripcion.grid(row=2, column=1, columnspan=2, sticky=tk.EW, padx=10)
-
-        ttk.Label(frame, text="Moneda:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=10)
-        self.moneda_var = tk.StringVar(value="bs")
-        ttk.Radiobutton(frame, text="Bolívares (bs)", variable=self.moneda_var, value="bs").grid(row=3, column=1)
-        ttk.Radiobutton(frame, text="Dólares (usd)", variable=self.moneda_var, value="usd").grid(row=3, column=2)
-
-        ttk.Label(frame, text="Monto:").grid(row=4, column=0, sticky=tk.W, padx=10)
-        self.entry_monto = ttk.Entry(frame)
-        self.entry_monto.grid(row=4, column=1, columnspan=2, sticky=tk.EW, padx=10)
-
-        btn_guardar = ttk.Button(frame, text="Registrar", command=self.guardar_transaccion)
-        btn_guardar.grid(row=5, column=0, columnspan=3, pady=20)
-
-    def guardar_transaccion(self):
-        tipo = self.tipo_var.get()
-        categoria = self.entry_categoria.get().strip()
-        descripcion = self.entry_descripcion.get().strip()
-        moneda = self.moneda_var.get()
-        try:
-            monto = float(self.entry_monto.get())
-        except ValueError:
-            messagebox.showerror("Error", "Monto inválido")
-            return
-        if monto <= 0:
-            messagebox.showerror("Error", "El monto debe ser mayor que cero")
-            return
-        if not categoria:
-            messagebox.showerror("Error", "Debe ingresar una categoría")
-            return
-        if self.usuario_actual:
-            registrar_transaccion(self.usuario_actual['id'], tipo, categoria, descripcion, moneda, monto)
-            messagebox.showinfo("Éxito", "Transacción registrada")
-            self.entry_categoria.delete(0, tk.END)
-            self.entry_descripcion.delete(0, tk.END)
-            self.entry_monto.delete(0, tk.END)
-            self.actualizar_tabla_transacciones()
-
-    def construir_tab_ver(self):
-        frame = self.tab_ver
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        filtro_frame = ttk.Frame(frame)
-        filtro_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Label(filtro_frame, text="Buscar texto:").grid(row=0, column=0)
-        self.busqueda_var = tk.StringVar()
-        entry_buscar = ttk.Entry(filtro_frame, textvariable=self.busqueda_var)
-        entry_buscar.grid(row=0, column=1, sticky=tk.W)
-        entry_buscar.bind('<KeyRelease>', lambda e: self.actualizar_tabla_transacciones())
-
-        ttk.Label(filtro_frame, text="Moneda:").grid(row=0, column=2, padx=5)
-        self.filtrar_moneda = ttk.Combobox(filtro_frame, state="readonly", values=["", "bs", "usd"], width=5)
-        self.filtrar_moneda.grid(row=0, column=3)
-        self.filtrar_moneda.bind('<<ComboboxSelected>>', lambda e: self.actualizar_tabla_transacciones())
-
-        ttk.Label(filtro_frame, text="Tipo:").grid(row=0, column=4, padx=5)
-        self.filtrar_tipo = ttk.Combobox(filtro_frame, state="readonly", values=["", "entrada", "salida"], width=8)
-        self.filtrar_tipo.grid(row=0, column=5)
-        self.filtrar_tipo.bind('<<ComboboxSelected>>', lambda e: self.actualizar_tabla_transacciones())
-
-        columnas = ("id", "fecha", "hora", "usuario", "tipo", "categoria", "descripcion", "moneda", "monto")
-        self.tree = ttk.Treeview(frame, columns=columnas, show='headings')
-        for col in columnas:
-            self.tree.heading(col, text=col.capitalize())
-            self.tree.column(col, width=80, anchor=tk.CENTER)
-        self.tree.column("descripcion", width=180, anchor=tk.W)
-        self.tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
-
-        self.actualizar_tabla_transacciones()
-
-    def actualizar_tabla_transacciones(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        filtros = {
-            'texto': self.busqueda_var.get().strip(),
-            'moneda': self.filtrar_moneda.get() if self.filtrar_moneda.get() in ('bs', 'usd') else None,
-            'tipo_mov': self.filtrar_tipo.get() if self.filtrar_tipo.get() in ('entrada', 'salida') else None
-        }
-        transacciones = obtener_transacciones(filtros)
-        for t in transacciones:
-            self.tree.insert('', 'end', values=t)
-
-    def construir_tab_capital(self):
-        frame = self.tab_capital
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        ttk.Label(frame, text="Registrar Capital del Inventario").grid(row=0, column=0, columnspan=2, pady=10)
-
-        ttk.Label(frame, text="Monto:").grid(row=1, column=0, sticky=tk.W, padx=10)
-        self.entry_monto_cap = ttk.Entry(frame)
-        self.entry_monto_cap.grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=10)
-
-        ttk.Label(frame, text="Descripción:").grid(row=2, column=0, sticky=tk.W, padx=10)
-        self.entry_descripcion_cap = ttk.Entry(frame)
-        self.entry_descripcion_cap.grid(row=2, column=1, columnspan=2, sticky=tk.EW, padx=10)
-
-        btn_guardar = ttk.Button(frame, text="Registrar", command=self.guardar_capital)
-        btn_guardar.grid(row=3, column=0, columnspan=2, pady=10)
-    
-    def guardar_capital(self):
-        try:
-            monto = float(self.entry_monto_cap.get())
-        except ValueError:
-            messagebox.showerror("Error", "Monto inválido")
-            return
-        descripcion = self.entry_descripcion_cap.get().strip()
-        if monto <= 0:
-            messagebox.showerror("Error", "El monto debe ser mayor a cero")
-            return
-        if self.usuario_actual:
-            registrar_transaccion(self.usuario_actual['id'], "entrada", "inventario", descripcion, "bs", monto)
-            messagebox.showinfo("Éxito", "Capital del inventario registrado")
-            self.entry_monto_cap.delete(0, tk.END)
-            self.entry_descripcion_cap.delete(0, tk.END)
-            self.actualizar_tabla_transacciones()
-            self.actualizar_balance()
-
-    def construir_tab_reportes(self):
-        frame = self.tab_reportes
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        ttk.Label(frame, text="Generar Reporte PDF de transacciones", font=("Helvetica", 14)).pack(pady=10)
-
-        btn_generar = ttk.Button(frame, text="Generar Reporte PDF", command=self.generar_reporte_pdf_ui)
-        btn_generar.pack(pady=5)
-
-        ttk.Label(frame, text="Exportar todas las transacciones a Excel", font=("Helvetica", 14)).pack(pady=10)
-
-        btn_exportar = ttk.Button(frame, text="Exportar a Excel", command=self.exportar_excel)
-        btn_exportar.pack(pady=5)
-
-        if self.usuario_actual and self.usuario_actual['tipo'] == 'master':
-            ttk.Label(frame, text="Importar transacciones desde Excel", font=("Helvetica", 14)).pack(pady=10)
-            btn_importar = ttk.Button(frame, text="Importar desde Excel", command=self.importar_excel)
-            btn_importar.pack(pady=5)
-
-        ttk.Label(frame, text="Balance Actual:", font=("Helvetica", 14)).pack(pady=10)
-        self.label_balance = ttk.Label(frame, text="")
-        self.label_balance.pack(pady=5)
-
-        self.actualizar_balance()
-
-    def actualizar_balance(self):
-        balances = calcular_balance()
-        texto = f"Bolívares (bs): {balances['bs']:.2f}  |  Dólares (usd): {balances['usd']:.2f}"
-        self.label_balance.config(text=texto)
-
-    def generar_reporte_pdf_ui(self):
-        transacciones = obtener_transacciones()
-        if not transacciones:
-            messagebox.showinfo("Info", "No hay transacciones para generar reporte")
-            return
-        ruta = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("Archivo PDF", "*.pdf")])
-        if not ruta:
-            return
-        generar_reporte_pdf(ruta, transacciones, self.usuario_actual)
-        messagebox.showinfo("Éxito", f"Reporte PDF generado:\n{ruta}")
-
-    def exportar_excel(self):
-        if self.usuario_actual and self.usuario_actual['tipo'] != 'master':
-            messagebox.showerror("Permiso denegado", "Solo usuarios master pueden exportar")
-            return
-        transacciones = obtener_transacciones()
-        if not transacciones:
-            messagebox.showinfo("Info", "No hay transacciones para exportar")
-            return
-        ruta = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-        if not ruta:
-            return
-        exportar_a_excel(ruta, transacciones)
-        messagebox.showinfo("Éxito", f"Archivo Excel exportado:\n{ruta}")
-
-    def importar_excel(self):
-        if self.usuario_actual and self.usuario_actual['tipo'] != 'master':
-            messagebox.showerror("Permiso denegado", "Solo usuarios master pueden importar")
-            return
-        ruta = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-        if not ruta:
-            return
-        transacciones = importar_desde_excel(ruta)
-        if not transacciones:
-            messagebox.showerror("Error", "Archivo Excel inválido o sin datos")
-            return
-        insertar_transacciones_importadas(transacciones)
-        messagebox.showinfo("Éxito", "Transacciones importadas correctamente")
-        self.actualizar_tabla_transacciones()
-        self.actualizar_balance()
-
-    def cerrar_sesion(self):
-        self.usuario_actual = None
-        self.ventana_login()
-
-    def limpiar_ventana(self):
+    def clear_screen(self):
         for widget in self.winfo_children():
             widget.destroy()
 
+    # ---------------------
+    # LOGIN
+    def create_login_screen(self):
+        self.clear_screen()
+        frame = Frame(self)
+        frame.pack(pady=100)
 
-if __name__ == '__main__':
-    app = Aplicacion()
+        Label(frame, text="Usuario:").grid(row=0, column=0, sticky=E)
+        usuario_entry = Entry(frame)
+        usuario_entry.grid(row=0, column=1, pady=5)
+
+        Label(frame, text="Contraseña:").grid(row=1, column=0, sticky=E)
+        password_entry = Entry(frame, show="*")
+        password_entry.grid(row=1, column=1, pady=5)
+
+        def login():
+            username = usuario_entry.get().strip()
+            password = password_entry.get()
+            if not username or not password:
+                messagebox.showwarning("Error", "Debe ingresar usuario y contraseña")
+                return
+            user = get_user(username)
+            if not user or not check_password(password, user["password"]):
+                messagebox.showerror("Error", "Usuario o contraseña incorrectos")
+                return
+            self.current_user = user
+            messagebox.showinfo("Bienvenido", f"Bienvenido {user['nombre']} {user['apellido']}")
+            self.create_main_screen()
+
+        Button(frame, text="Ingresar", command=login).grid(row=2, column=0, columnspan=2, pady=10)
+        Button(frame, text="Registrarse", command=lambda: self.create_user_registration_screen(solo_estandar=True)).grid(row=4, column=0, columnspan=2)
+        # Crear usuario master si no existe ninguno
+        masters = DB.query("SELECT * FROM usuarios WHERE tipo='master'")
+        if not masters:
+            if messagebox.askyesno("Registro inicial", "No hay usuario MASTER. Crear uno ahora?"):
+                self.create_user_registration_screen(master_creation=True)
+
+    # ---------------------
+    # PANTALLA PRINCIPAL CON PESTAÑAS
+    def create_main_screen(self):
+        self.clear_screen()
+
+        menubar = Menu(self)
+        self.config(menu=menubar)
+
+        # Menú Archivo
+        archivo_menu = Menu(menubar, tearoff=0)
+        archivo_menu.add_command(label="Backup Manual", command=self.backup_manual)
+        archivo_menu.add_separator()
+        archivo_menu.add_command(label="Cerrar Sesión", command=self.logout)
+        archivo_menu.add_command(label="Salir", command=self.on_close)
+        menubar.add_cascade(label="Archivo", menu=archivo_menu)
+
+        # Menú Usuarios (solo para master)
+        if self.current_user and self.current_user["tipo"] == "master":
+            user_menu = Menu(menubar, tearoff=0)
+            user_menu.add_command(label="Registrar Usuario", command=self.create_user_registration_screen)
+            user_menu.add_command(label="Historial de Cambios", command=self.view_change_history)
+            menubar.add_cascade(label="Usuarios", menu=user_menu)
+
+        # Menú Ayuda
+        ayuda_menu = Menu(menubar, tearoff=0)
+        ayuda_menu.add_command(label="Acerca de", command=self.show_about)
+        ayuda_menu.add_command(label="Verificar actualización", command=self.check_update)
+        menubar.add_cascade(label="Ayuda", menu=ayuda_menu)
+
+        # Pestañas
+        tab_control = ttk.Notebook(self)
+        tab_control.pack(expand=1, fill="both")
+
+        # Pestaña transacciones
+        tab_transacciones = Frame(tab_control)
+        tab_control.add(tab_transacciones, text="Transacciones")
+        self.build_tab_transacciones(tab_transacciones)
+
+        # Pestaña cuentas por cobrar
+        tab_cxc = Frame(tab_control)
+        tab_control.add(tab_cxc, text="Cuentas por Cobrar")
+        self.build_tab_cuentas_por_cobrar(tab_cxc)
+
+        # Pestaña cuentas por pagar
+        tab_cxp = Frame(tab_control)
+        tab_control.add(tab_cxp, text="Cuentas por Pagar")
+        self.build_tab_cuentas_por_pagar(tab_cxp)
+
+        # Pestaña reportes
+        tab_reportes = Frame(tab_control)
+        tab_control.add(tab_reportes, text="Reportes")
+        self.build_tab_reportes(tab_reportes)
+
+    def logout(self):
+        if messagebox.askyesno("Cerrar Sesión", "¿Desea cerrar sesión?"):
+            self.current_user = None
+            self.create_login_screen()
+
+    # ---------------------
+    # USUARIOS
+
+    def create_user_registration_screen(self, master_creation=False, solo_estandar=False):
+        self.clear_screen()
+        frame = Frame(self)
+        frame.pack(pady=20)
+
+        Label(frame, text="Nombre:").grid(row=0, column=0, sticky=E)
+        nombre_entry = Entry(frame)
+        nombre_entry.grid(row=0, column=1)
+
+        Label(frame, text="Apellido:").grid(row=1, column=0, sticky=E)
+        apellido_entry = Entry(frame)
+        apellido_entry.grid(row=1, column=1)
+
+        Label(frame, text="Cédula:").grid(row=2, column=0, sticky=E)
+        cedula_entry = Entry(frame)
+        cedula_entry.grid(row=2, column=1)
+
+        Label(frame, text="Usuario (username):").grid(row=3, column=0, sticky=E)
+        username_entry = Entry(frame)
+        username_entry.grid(row=3, column=1)
+
+        Label(frame, text="Contraseña:").grid(row=4, column=0, sticky=E)
+        password_entry = Entry(frame, show="*")
+        password_entry.grid(row=4, column=1)
+        if not solo_estandar or not master_creation:
+            Label(frame, text="Tipo:").grid(row=5, column=0, sticky=E)
+        tipo_var = StringVar(value="estandar")
+        if master_creation:
+            tipo_var.set("master")
+        elif solo_estandar:
+            tipo_var.set("estandar")
+        else:
+            Radiobutton(frame, text="Master", variable=tipo_var, value="master").grid(row=5, column=1, sticky=W)
+            Radiobutton(frame, text="Estándar", variable=tipo_var, value="estandar").grid(row=5, column=1, sticky=E)
+
+        def register_user():
+            nombre = nombre_entry.get().strip()
+            apellido = apellido_entry.get().strip()
+            cedula = cedula_entry.get().strip()
+            username = username_entry.get().strip()
+            password = password_entry.get()
+            tipo = tipo_var.get()
+
+            if not all([nombre, apellido, cedula, username, password]):
+                messagebox.showwarning("Error", "Todos los campos son obligatorios")
+                return
+            if len(password) < 4:
+                messagebox.showwarning("Error", "La contraseña debe tener al menos 4 caracteres")
+                return
+            if get_user(username):
+                messagebox.showerror("Error", "El usuario ya existe")
+                return
+
+            hashed = hash_password(password)
+            try:
+                DB.execute("""
+                    INSERT INTO usuarios (nombre, apellido, cedula, username, password, tipo)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (nombre, apellido, cedula, username, hashed, tipo))
+                messagebox.showinfo("Éxito", "Usuario registrado correctamente")
+                self.create_login_screen()
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo registrar el usuario: {e}")
+
+        Button(frame, text="Registrar", command=register_user).grid(row=6, column=0, columnspan=2, pady=10)
+        if not master_creation:
+            Button(frame, text="Cancelar", command=self.create_login_screen if solo_estandar else self.create_main_screen).grid(row=7, column=0, columnspan=2)
+
+    # ---------------------
+    # TRANSACCIONES
+
+    def build_tab_transacciones(self, container):
+        frm_top = Frame(container)
+        frm_top.pack(fill=X, pady=5)
+        frm_buttons = Frame(container)
+        frm_buttons.pack(fill=X, pady=5)
+        frm_balance = Frame(container)
+        frm_balance.pack(fill=X, pady=5)
+
+        balance_label = Label(frm_balance, text="Balance: Calculando...", fg="blue")
+        balance_label.pack(side=LEFT, padx=10)
+        frm_table = Frame(container)
+        frm_table.pack(expand=1, fill=BOTH)
+
+        # Campos de entrada
+        Label(frm_top, text="Tipo:").grid(row=0, column=0)
+        tipo_var = StringVar(value="entrada")
+        ttk.Combobox(frm_top, textvariable=tipo_var, values=["entrada", "salida"], state="readonly", width=10).grid(row=0, column=1)
+
+        Label(frm_top, text="Monto:").grid(row=0, column=2)
+        monto_entry = Entry(frm_top, width=15)
+        monto_entry.grid(row=0, column=3)
+
+        Label(frm_top, text="Moneda:").grid(row=0, column=4)
+        moneda_var = StringVar(value="Bs")
+        ttk.Combobox(frm_top, textvariable=moneda_var, values=["Bs", "USD"], state="readonly", width=5).grid(row=0, column=5)
+
+        Label(frm_top, text="Medio:").grid(row=0, column=6)
+        medio_var = StringVar(value="fisico")
+        ttk.Combobox(frm_top, textvariable=medio_var, values=["fisico", "digital"], state="readonly", width=7).grid(row=0, column=7)
+
+        Label(frm_top, text="Banco Ven:").grid(row=1, column=0)
+        banco_ven_entry = Entry(frm_top, width=10)
+        banco_ven_entry.grid(row=1, column=1)
+        banco_ven_entry.insert(0, "0")
+
+        Label(frm_top, text="Banco Mercantil:").grid(row=1, column=2)
+        banco_merc_entry = Entry(frm_top, width=10)
+        banco_merc_entry.grid(row=1, column=3)
+        banco_merc_entry.insert(0, "0")
+
+        Label(frm_top, text="Banco Banesco:").grid(row=1, column=4)
+        banco_ban_entry = Entry(frm_top, width=10)
+        banco_ban_entry.grid(row=1, column=5)
+        banco_ban_entry.insert(0, "0")
+
+        Label(frm_top, text="Descripción:").grid(row=1, column=6)
+        descripcion_entry = Entry(frm_top, width=25)
+        descripcion_entry.grid(row=1, column=7)
+
+        # Tabla
+        cols = ("ID", "Usuario", "Tipo", "Monto", "Moneda", "Medio", "Banco Ven", "Banco Mercantil", "Banco Banesco", "Descripción", "Fecha")
+        tree = ttk.Treeview(frm_table, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, minwidth=50, width=90, stretch=False)
+        tree.pack(expand=1, fill=BOTH)
+
+        def load_transactions():
+            for row in tree.get_children():
+                tree.delete(row)
+            data = DB.query("SELECT * FROM transacciones ORDER BY fecha DESC")
+            for d in data:
+                tree.insert("", END, values=(
+                    d["id"], d["usuario"], d["tipo"], f"{d['monto']:.2f}", d["moneda"], d["medio"],
+                    f"{d['banco_ven']:.2f}", f"{d['banco_mercantil']:.2f}", f"{d['banco_banesco']:.2f}",
+                    d["descripcion"] or "", d["fecha"]
+                ))
+            entradas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada'")
+            salidas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida'")
+
+            total_entrada = entradas[0]["total"] or 0
+            total_salida = salidas[0]["total"] or 0
+            balance = total_entrada - total_salida
+
+            balance_label.config(text=f"Balance actual: {balance:.2f}")
+
+        def add_transaction():
+            try:
+                monto = float(monto_entry.get())
+                banco_ven = float(banco_ven_entry.get())
+                banco_merc = float(banco_merc_entry.get())
+                banco_ban = float(banco_ban_entry.get())
+            except ValueError:
+                messagebox.showwarning("Error", "Monto y bancos deben ser números válidos")
+                return
+            tipo = tipo_var.get()
+            moneda = moneda_var.get()
+            medio = medio_var.get()
+            descripcion = descripcion_entry.get().strip()
+            if monto <= 0:
+                messagebox.showwarning("Error", "El monto debe ser mayor a cero")
+                return
+            if self.current_user:
+                DB.execute("""
+                    INSERT INTO transacciones (usuario, tipo, monto, moneda, medio, banco_ven, banco_mercantil, banco_banesco, descripcion)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (self.current_user["username"], tipo, monto, moneda, medio, banco_ven, banco_merc, banco_ban, descripcion))
+                log_change(self.current_user["username"], "insert", "transacciones", DB.execute("SELECT last_insert_rowid()").fetchone()[0], descripcion)
+                messagebox.showinfo("Éxito", "Transacción registrada")
+                load_transactions()
+                # Limpiar
+                monto_entry.delete(0, END)
+                descripcion_entry.delete(0, END)
+                banco_ven_entry.delete(0, END)
+                banco_ven_entry.insert(0, "0")
+                banco_merc_entry.delete(0, END)
+                banco_merc_entry.insert(0, "0")
+                banco_ban_entry.delete(0, END)
+                banco_ban_entry.insert(0, "0")
+
+        def delete_transaction():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Error", "Seleccione una transacción para eliminar")
+                return
+            if self.current_user and self.current_user["tipo"] != "master":
+                messagebox.showerror("Permiso denegado", "Solo usuarios MASTER pueden eliminar transacciones")
+                return
+            tid = tree.item(selected[0])["values"][0]
+            if self.current_user and messagebox.askyesno("Confirmar", "¿Eliminar transacción seleccionada?"):
+                DB.execute("DELETE FROM transacciones WHERE id = ?", (tid,))
+                log_change(self.current_user["username"], "delete", "transacciones", tid, "Eliminada desde interfaz")
+                load_transactions()
+
+        Button(frm_buttons, text="Agregar", command=add_transaction).pack(side=LEFT, padx=5)
+        Button(frm_buttons, text="Eliminar", command=delete_transaction).pack(side=LEFT, padx=5)
+
+        load_transactions()
+
+    # ---------------------
+    # CUENTAS POR COBRAR
+
+    def build_tab_cuentas_por_cobrar(self, container):
+        frm_top = Frame(container)
+        frm_top.pack(fill=X, pady=5)
+        frm_buttons = Frame(container)
+        frm_buttons.pack(fill=X, pady=5)
+        frm_table = Frame(container)
+        frm_table.pack(expand=1, fill=BOTH)
+
+        Label(frm_top, text="Cliente:").grid(row=0, column=0)
+        cliente_entry = Entry(frm_top, width=20)
+        cliente_entry.grid(row=0, column=1)
+
+        Label(frm_top, text="Monto:").grid(row=0, column=2)
+        monto_entry = Entry(frm_top, width=15)
+        monto_entry.grid(row=0, column=3)
+
+        Label(frm_top, text="Moneda:").grid(row=0, column=4)
+        moneda_var = StringVar(value="Bs")
+        ttk.Combobox(frm_top, textvariable=moneda_var, values=["Bs", "USD"], state="readonly", width=5).grid(row=0, column=5)
+
+        Label(frm_top, text="Fecha Vencimiento (YYYY-MM-DD):").grid(row=1, column=0)
+        venc_entry = Entry(frm_top, width=15)
+        venc_entry.grid(row=1, column=1)
+
+        Label(frm_top, text="Descripción:").grid(row=1, column=2)
+        descripcion_entry = Entry(frm_top, width=30)
+        descripcion_entry.grid(row=1, column=3, columnspan=3)
+
+        cols = ("ID", "Cliente", "Monto", "Moneda", "Vencimiento", "Estado", "Descripción", "Registro")
+        tree = ttk.Treeview(frm_table, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, minwidth=50, width=100, stretch=False)
+        tree.pack(expand=1, fill=BOTH)
+
+        def load_cxc():
+            for row in tree.get_children():
+                tree.delete(row)
+            data = DB.query("SELECT * FROM cuentas_por_cobrar ORDER BY fecha_vencimiento")
+            for d in data:
+                tree.insert("", END, values=(
+                    d["id"], d["cliente"], f"{d['monto']:.2f}", d["moneda"], d["fecha_vencimiento"], d["estado"],
+                    d["descripcion"] or "", d["fecha_registro"]
+                ))
+
+        def add_cxc():
+            cliente = cliente_entry.get().strip()
+            desc = descripcion_entry.get().strip()
+            moneda = moneda_var.get()
+            try:
+                monto = float(monto_entry.get())
+            except:
+                messagebox.showwarning("Error", "Monto inválido")
+                return
+            fecha_venc = venc_entry.get().strip()
+            try:
+                datetime.strptime(fecha_venc, "%Y-%m-%d")
+            except:
+                messagebox.showwarning("Error", "Formato de fecha vencimiento inválido")
+                return
+            if monto <= 0 or not cliente:
+                messagebox.showwarning("Error", "Complete todos los campos correctamente")
+                return
+            DB.execute("""
+                INSERT INTO cuentas_por_cobrar (cliente, monto, moneda, fecha_vencimiento, descripcion)
+                VALUES (?, ?, ?, ?, ?)
+            """, (cliente, monto, moneda, fecha_venc, desc))
+            messagebox.showinfo("Éxito", "Cuenta por cobrar registrada")
+            load_cxc()
+            cliente_entry.delete(0, END)
+            monto_entry.delete(0, END)
+            venc_entry.delete(0, END)
+            descripcion_entry.delete(0, END)
+
+        def mark_paid_cxc():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Error", "Seleccione una cuenta por cobrar")
+                return
+            cid = tree.item(selected[0])["values"][0]
+            DB.execute("UPDATE cuentas_por_cobrar SET estado = 'pagada' WHERE id = ?", (cid,))
+            messagebox.showinfo("Éxito", "Cuenta por cobrar marcada como pagada")
+            load_cxc()
+
+        Button(frm_buttons, text="Agregar", command=add_cxc).pack(side=LEFT, padx=5)
+        Button(frm_buttons, text="Marcar como Pagada", command=mark_paid_cxc).pack(side=LEFT, padx=5)
+
+        load_cxc()
+
+    # ---------------------
+    # CUENTAS POR PAGAR
+
+    def build_tab_cuentas_por_pagar(self, container):
+        frm_top = Frame(container)
+        frm_top.pack(fill=X, pady=5)
+        frm_buttons = Frame(container)
+        frm_buttons.pack(fill=X, pady=5)
+        frm_table = Frame(container)
+        frm_table.pack(expand=1, fill=BOTH)
+
+        Label(frm_top, text="Proveedor:").grid(row=0, column=0)
+        proveedor_entry = Entry(frm_top, width=20)
+        proveedor_entry.grid(row=0, column=1)
+
+        Label(frm_top, text="Monto:").grid(row=0, column=2)
+        monto_entry = Entry(frm_top, width=15)
+        monto_entry.grid(row=0, column=3)
+
+        Label(frm_top, text="Moneda:").grid(row=0, column=4)
+        moneda_var = StringVar(value="Bs")
+        ttk.Combobox(frm_top, textvariable=moneda_var, values=["Bs", "USD"], state="readonly", width=5).grid(row=0, column=5)
+
+        Label(frm_top, text="Fecha Vencimiento (YYYY-MM-DD):").grid(row=1, column=0)
+        venc_entry = Entry(frm_top, width=15)
+        venc_entry.grid(row=1, column=1)
+
+        Label(frm_top, text="Descripción:").grid(row=1, column=2)
+        descripcion_entry = Entry(frm_top, width=30)
+        descripcion_entry.grid(row=1, column=3, columnspan=3)
+
+        cols = ("ID", "Proveedor", "Monto", "Moneda", "Vencimiento", "Estado", "Descripción", "Registro")
+        tree = ttk.Treeview(frm_table, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, minwidth=50, width=100, stretch=False)
+        tree.pack(expand=1, fill=BOTH)
+
+        def load_cxp():
+            for row in tree.get_children():
+                tree.delete(row)
+            data = DB.query("SELECT * FROM cuentas_por_pagar ORDER BY fecha_vencimiento")
+            for d in data:
+                tree.insert("", END, values=(
+                    d["id"], d["proveedor"], f"{d['monto']:.2f}", d["moneda"], d["fecha_vencimiento"], d["estado"],
+                    d["descripcion"] or "", d["fecha_registro"]
+                ))
+
+        def add_cxp():
+            proveedor = proveedor_entry.get().strip()
+            desc = descripcion_entry.get().strip()
+            moneda = moneda_var.get()
+            try:
+                monto = float(monto_entry.get())
+            except:
+                messagebox.showwarning("Error", "Monto inválido")
+                return
+            fecha_venc = venc_entry.get().strip()
+            try:
+                datetime.strptime(fecha_venc, "%Y-%m-%d")
+            except:
+                messagebox.showwarning("Error", "Formato de fecha vencimiento inválido")
+                return
+            if monto <= 0 or not proveedor:
+                messagebox.showwarning("Error", "Complete todos los campos correctamente")
+                return
+            DB.execute("""
+                INSERT INTO cuentas_por_pagar (proveedor, monto, moneda, fecha_vencimiento, descripcion)
+                VALUES (?, ?, ?, ?, ?)
+            """, (proveedor, monto, moneda, fecha_venc, desc))
+            messagebox.showinfo("Éxito", "Cuenta por pagar registrada")
+            load_cxp()
+            proveedor_entry.delete(0, END)
+            monto_entry.delete(0, END)
+            venc_entry.delete(0, END)
+            descripcion_entry.delete(0, END)
+
+        def mark_paid_cxp():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Error", "Seleccione una cuenta por pagar")
+                return
+            cid = tree.item(selected[0])["values"][0]
+            DB.execute("UPDATE cuentas_por_pagar SET estado = 'pagada' WHERE id = ?", (cid,))
+            messagebox.showinfo("Éxito", "Cuenta por pagar marcada como pagada")
+            load_cxp()
+
+        Button(frm_buttons, text="Agregar", command=add_cxp).pack(side=LEFT, padx=5)
+        Button(frm_buttons, text="Marcar como Pagada", command=mark_paid_cxp).pack(side=LEFT, padx=5)
+
+        load_cxp()
+
+    # ---------------------
+    # REPORTES
+
+    def build_tab_reportes(self, container):
+        frm_top = Frame(container)
+        frm_top.pack(pady=10)
+
+        Label(frm_top, text="Generar reporte completo:").pack(side=LEFT, padx=5)
+        Button(frm_top, text="Generar PDF", command=self.generate_report_pdf).pack(side=LEFT)
+
+        self.report_label = Label(container, text="", fg="green")
+        self.report_label.pack(pady=10)
+
+    def generate_report_pdf(self):
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                filetypes=[("PDF files", "*.pdf")],
+                initialfile=f"reporte_financiero_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            )
+            if not filename:
+                return
+            if self.current_user:
+                generate_pdf_report(self.current_user["username"], filename)
+                self.report_label.config(text=f"Reporte generado: {filename}")
+                messagebox.showinfo("Reporte", f"Reporte PDF generado correctamente en:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo generar el reporte: {e}")
+
+    # ---------------------
+    # HISTORIAL DE CAMBIOS
+
+    def view_change_history(self):
+        self.clear_screen()
+        frame = Frame(self)
+        frame.pack(expand=1, fill=BOTH)
+
+        Label(frame, text="Historial de Cambios", font=("Arial", 14, "bold")).pack(pady=10)
+
+        cols = ("ID", "Usuario", "Acción", "Tabla", "ID Registro", "Descripción", "Fecha")
+        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, minwidth=50, width=120, stretch=False)
+        tree.pack(expand=1, fill=BOTH, padx=10, pady=10)
+
+        def load_history():
+            for row in tree.get_children():
+                tree.delete(row)
+            data = DB.query("SELECT * FROM historial_cambios ORDER BY fecha DESC LIMIT 1000")
+            for d in data:
+                tree.insert("", END, values=(
+                    d["id"], d["usuario"], d["accion"], d["tabla"], d["registro_id"], d["descripcion"] or "", d["fecha"]
+                ))
+        load_history()
+
+        Button(frame, text="Volver", command=self.create_main_screen).pack(pady=10)
+
+    # ---------------------
+    # AYUDA / ACERCA DE
+
+    def show_about(self):
+        messagebox.showinfo("Acerca de", f"Sistema Financiero Completo\nVersión {APP_VERSION}\nDesarrollado por Ing Douglas Hidalgo")
+
+    def check_update(self):
+        # Demo muy básico de actualización: solo verifica un archivo local con versión
+        if not os.path.exists(VERSION_CHECK_FILE):
+            messagebox.showinfo("Actualización", "No se encontró información de actualización.")
+            return
+        with open(VERSION_CHECK_FILE, "r") as f:
+            latest_version = f.read().strip()
+        if latest_version > APP_VERSION:
+            messagebox.showinfo("Actualización disponible", f"Existe una versión más reciente: {latest_version}\nDescargue la nueva versión desde el sitio oficial.")
+        else:
+            messagebox.showinfo("Actualización", "Usted tiene la última versión.")
+
+    # ---------------------
+    # BACKUP MANUAL
+
+    def backup_manual(self):
+        success, msg = backup_database()
+        if success:
+            messagebox.showinfo("Backup", f"Backup realizado correctamente:\n{msg}")
+        else:
+            messagebox.showerror("Backup", f"Error al hacer backup:\n{msg}")
+
+# ------------------------------
+# EJECUCIÓN
+
+if __name__ == "__main__":
+    app = App()
     app.mainloop()
+    DB.close()
