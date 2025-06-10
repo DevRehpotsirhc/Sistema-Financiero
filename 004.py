@@ -787,7 +787,7 @@ class App(Tk):
     # AYUDA / ACERCA DE
 
     def show_about(self):
-        messagebox.showinfo("Acerca de", f"Sistema Financiero Completo\nVersión {APP_VERSION}\nDesarrollado por Ing Douglas Hidalgo")
+        messagebox.showinfo("Acerca de", f"Sistema Financiero Completo\nVersión {APP_VERSION}\nDesarrollado por Ing Douglas Hidalgo ft. Christopher Aponte")
 
     def check_update(self):
         # Demo muy básico de actualización: solo verifica un archivo local con versión
