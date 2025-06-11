@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from hashlib import sha256
-from tkinter import *
+from tkinter import * # type: ignore
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from fpdf import FPDF
 
@@ -72,10 +72,9 @@ def init_db():
         monto REAL NOT NULL,
         moneda TEXT NOT NULL CHECK(moneda IN ('Bs','USD')),
         medio TEXT NOT NULL CHECK(medio IN ('fisico','digital')),
-        banco_ven REAL DEFAULT 0,
-        banco_mercantil REAL DEFAULT 0,
-        banco_banesco REAL DEFAULT 0,
+        banco TEXT NOT NULL CHECK(banco IN ('ven', 'mercantil', 'banesco')) DEFAULT 'ven',
         descripcion TEXT,
+        eliminado INTEGER DEFAULT 0,
         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
@@ -173,8 +172,8 @@ def generate_pdf_report(username, filename="reporte_financiero.pdf"):
     pdf.ln(5)
 
     # Resumen transacciones
-    entradas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada'")
-    salidas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida'")
+    entradas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada' AND eliminado = 0")
+    salidas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida' AND eliminado = 0")
 
     total_entrada = entradas[0]["total"] or 0
     total_salida = salidas[0]["total"] or 0
@@ -185,6 +184,41 @@ def generate_pdf_report(username, filename="reporte_financiero.pdf"):
     pdf.cell(0, 10, f"Balance Neto: {balance:.2f}", ln=1)
     pdf.ln(10)
 
+    pdf.cell(0, 10, "Balance detallado por banco y moneda:", ln=1)
+    bancos = ['ven', 'mercantil', 'banesco']
+    monedas = ['Bs', 'USD']
+
+    for moneda in monedas:
+        pdf.cell(0, 10, f"Moneda: {moneda}", ln=1)
+        total_moneda = 0
+        for banco in bancos:
+            entradas = DB.query("""
+                SELECT SUM(monto) as total FROM transacciones
+                WHERE tipo='entrada' AND eliminado = 0 AND moneda=? AND banco=?
+            """, (moneda, banco))
+            salidas = DB.query("""
+                SELECT SUM(monto) as total FROM transacciones
+                WHERE tipo='salida' AND eliminado = 0 AND moneda=? AND banco=?
+            """, (moneda, banco))
+
+            total_entrada = entradas[0]["total"] or 0
+            total_salida = salidas[0]["total"] or 0
+            balance_banco = total_entrada - total_salida
+            total_moneda += balance_banco
+
+            pdf.cell(0, 8, f" - {banco.capitalize()}: {balance_banco:.2f}", ln=1)
+
+        pdf.cell(0, 8, f"Total {moneda}: {total_moneda:.2f}", ln=1)
+        pdf.ln(3)
+
+    # Balance total general por moneda
+    total_bs = DB.query("SELECT SUM(CASE WHEN tipo='entrada' THEN monto ELSE -monto END) as total FROM transacciones WHERE eliminado = 0 AND moneda = 'Bs'")[0]["total"] or 0
+    total_usd = DB.query("SELECT SUM(CASE WHEN tipo='entrada' THEN monto ELSE -monto END) as total FROM transacciones WHERE eliminado = 0 AND moneda = 'USD'")[0]["total"] or 0
+
+    pdf.ln(5)
+    pdf.cell(0, 10, f"Balance Total General:", ln=1)
+    pdf.cell(0, 8, f" - En Bs: {total_bs:.2f}", ln=1)
+    pdf.cell(0, 8, f" - En USD: {total_usd:.2f}", ln=1)
     # Cuentas por cobrar
     pdf.cell(0, 10, "Cuentas por Cobrar:", ln=1)
     cxc = DB.query("SELECT * FROM cuentas_por_cobrar ORDER BY fecha_vencimiento")
@@ -242,6 +276,59 @@ class App(Tk):
     def clear_screen(self):
         for widget in self.winfo_children():
             widget.destroy()
+    
+    def open_trash_bin(self):
+        self.clear_screen()
+        frame = Frame(self)
+        frame.pack(expand=1, fill=BOTH)
+
+        Label(frame, text="Papelera", font=("Arial", 14, "bold")).pack(pady=10)
+
+        cols = ("ID", "Usuario", "Tipo", "Monto", "Moneda", "Medio", "Descripción", "Fecha")
+        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=100, stretch=False)
+        tree.pack(expand=1, fill=BOTH, padx=10, pady=10)
+
+        def load_deleted():
+            for row in tree.get_children():
+                tree.delete(row)
+            data = DB.query("SELECT * FROM transacciones WHERE eliminado = 1 ORDER BY fecha DESC")
+            for d in data:
+                tree.insert("", END, values=(
+                    d["id"], d["usuario"], d["tipo"], f"{d['monto']:.2f}", d["moneda"], d["medio"],
+                    d["descripcion"] or "", d["fecha"]
+                ))
+
+        def restore_transaction():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Error", "Seleccione una transacción para restaurar")
+                return
+            tid = tree.item(selected[0])["values"][0]
+            DB.execute("UPDATE transacciones SET eliminado = 0 WHERE id = ?", (tid,))
+            if self.current_user:
+                log_change(self.current_user["username"], "restore", "transacciones", tid, "Restaurada desde papelera")
+                load_deleted()
+        
+        def permanently_delete_transaction():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Error", "Seleccione una transacción para eliminar definitivamente")
+                return
+            tid = tree.item(selected[0])["values"][0]
+            if messagebox.askyesno("Confirmar", "¿Eliminar esta transacción de forma permanente?"):
+                DB.execute("DELETE FROM transacciones WHERE id = ?", (tid,))
+                if self.current_user:
+                    log_change(self.current_user["username"], "purge", "transacciones", tid, "Eliminación definitiva desde papelera")
+                    load_deleted()
+
+        Button(frame, text="Restaurar", command=restore_transaction).pack(pady=5)
+        Button(frame, text="Eliminar Permanentemente", fg="red", command=permanently_delete_transaction).pack(pady=5)
+        Button(frame, text="Volver", command=self.create_main_screen).pack(pady=5)
+
+        load_deleted()
 
     # ---------------------
     # LOGIN
@@ -271,7 +358,7 @@ class App(Tk):
             self.current_user = user
             messagebox.showinfo("Bienvenido", f"Bienvenido {user['nombre']} {user['apellido']}")
             self.create_main_screen()
-
+        
         Button(frame, text="Ingresar", command=login).grid(row=2, column=0, columnspan=2, pady=10)
         Button(frame, text="Registrarse", command=lambda: self.create_user_registration_screen(solo_estandar=True)).grid(row=4, column=0, columnspan=2)
         # Crear usuario master si no existe ninguno
@@ -291,6 +378,8 @@ class App(Tk):
         # Menú Archivo
         archivo_menu = Menu(menubar, tearoff=0)
         archivo_menu.add_command(label="Backup Manual", command=self.backup_manual)
+        if self.current_user and self.current_user["tipo"] == "master":
+            archivo_menu.add_command(label="Papelera", command=self.open_trash_bin)
         archivo_menu.add_separator()
         archivo_menu.add_command(label="Cerrar Sesión", command=self.logout)
         archivo_menu.add_command(label="Salir", command=self.on_close)
@@ -365,7 +454,7 @@ class App(Tk):
         Label(frame, text="Contraseña:").grid(row=4, column=0, sticky=E)
         password_entry = Entry(frame, show="*")
         password_entry.grid(row=4, column=1)
-        if not solo_estandar or not master_creation:
+        if not solo_estandar:
             Label(frame, text="Tipo:").grid(row=5, column=0, sticky=E)
         tipo_var = StringVar(value="estandar")
         if master_creation:
@@ -413,6 +502,11 @@ class App(Tk):
     # TRANSACCIONES
 
     def build_tab_transacciones(self, container):
+        banco_labels = {
+            "ven": "Venezuela",
+            "mercantil": "Mercantil",
+            "banesco": "Banesco"
+        }
         frm_top = Frame(container)
         frm_top.pack(fill=X, pady=5)
         frm_buttons = Frame(container)
@@ -442,27 +536,18 @@ class App(Tk):
         medio_var = StringVar(value="fisico")
         ttk.Combobox(frm_top, textvariable=medio_var, values=["fisico", "digital"], state="readonly", width=7).grid(row=0, column=7)
 
-        Label(frm_top, text="Banco Ven:").grid(row=1, column=0)
-        banco_ven_entry = Entry(frm_top, width=10)
-        banco_ven_entry.grid(row=1, column=1)
-        banco_ven_entry.insert(0, "0")
+        Label(frm_top, text="Banco:").grid(row=0, column=8)
+        banco_display = list(banco_labels.values())
+        banco_var = StringVar(value=banco_display[0])
+        ttk.Combobox(frm_top, textvariable=banco_var, values=banco_display, state="readonly", width=12).grid(row=0, column=9)
 
-        Label(frm_top, text="Banco Mercantil:").grid(row=1, column=2)
-        banco_merc_entry = Entry(frm_top, width=10)
-        banco_merc_entry.grid(row=1, column=3)
-        banco_merc_entry.insert(0, "0")
-
-        Label(frm_top, text="Banco Banesco:").grid(row=1, column=4)
-        banco_ban_entry = Entry(frm_top, width=10)
-        banco_ban_entry.grid(row=1, column=5)
-        banco_ban_entry.insert(0, "0")
 
         Label(frm_top, text="Descripción:").grid(row=1, column=6)
         descripcion_entry = Entry(frm_top, width=25)
         descripcion_entry.grid(row=1, column=7)
 
         # Tabla
-        cols = ("ID", "Usuario", "Tipo", "Monto", "Moneda", "Medio", "Banco Ven", "Banco Mercantil", "Banco Banesco", "Descripción", "Fecha")
+        cols = ("ID", "Usuario", "Tipo", "Monto", "Moneda", "Medio", "Banco", "Descripción", "Fecha")
         tree = ttk.Treeview(frm_table, columns=cols, show="headings")
         for c in cols:
             tree.heading(c, text=c)
@@ -472,28 +557,33 @@ class App(Tk):
         def load_transactions():
             for row in tree.get_children():
                 tree.delete(row)
-            data = DB.query("SELECT * FROM transacciones ORDER BY fecha DESC")
+            data = DB.query("SELECT * FROM transacciones WHERE eliminado = 0 ORDER BY fecha DESC")
             for d in data:
                 tree.insert("", END, values=(
-                    d["id"], d["usuario"], d["tipo"], f"{d['monto']:.2f}", d["moneda"], d["medio"],
-                    f"{d['banco_ven']:.2f}", f"{d['banco_mercantil']:.2f}", f"{d['banco_banesco']:.2f}",
-                    d["descripcion"] or "", d["fecha"]
+                    d["id"], d["usuario"], d["tipo"], f"{d['monto']:.2f}", d["moneda"], d["medio"], banco_labels.get(d["banco"], d["banco"]), d["descripcion"] or "", d["fecha"]
                 ))
-            entradas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada'")
-            salidas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida'")
+
+            # Balance general
+            entradas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada' AND eliminado = 0")
+            salidas = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida' AND eliminado = 0")
 
             total_entrada = entradas[0]["total"] or 0
             total_salida = salidas[0]["total"] or 0
-            balance = total_entrada - total_salida
+            # Balance por moneda
+            entradas_bs = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada' AND eliminado = 0 AND moneda='Bs'")[0]["total"] or 0
+            salidas_bs = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida' AND eliminado = 0 AND moneda='Bs'")[0]["total"] or 0
+            balance_bs = entradas_bs - salidas_bs
 
-            balance_label.config(text=f"Balance actual: {balance:.2f}")
+            entradas_usd = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada' AND eliminado = 0 AND moneda='USD'")[0]["total"] or 0
+            salidas_usd = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida' AND eliminado = 0 AND moneda='USD'")[0]["total"] or 0
+            balance_usd = entradas_usd - salidas_usd
+
+            balance_label.config(text=f"Balance Bs: {balance_bs:.2f} | USD: {balance_usd:.2f}")
 
         def add_transaction():
             try:
                 monto = float(monto_entry.get())
-                banco_ven = float(banco_ven_entry.get())
-                banco_merc = float(banco_merc_entry.get())
-                banco_ban = float(banco_ban_entry.get())
+                banco = banco_var.get()
             except ValueError:
                 messagebox.showwarning("Error", "Monto y bancos deben ser números válidos")
                 return
@@ -504,23 +594,20 @@ class App(Tk):
             if monto <= 0:
                 messagebox.showwarning("Error", "El monto debe ser mayor a cero")
                 return
+            
+            banco_nombre = banco_var.get()
+            banco = [k for k, v in banco_labels.items() if v == banco_nombre][0]
             if self.current_user:
                 DB.execute("""
-                    INSERT INTO transacciones (usuario, tipo, monto, moneda, medio, banco_ven, banco_mercantil, banco_banesco, descripcion)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (self.current_user["username"], tipo, monto, moneda, medio, banco_ven, banco_merc, banco_ban, descripcion))
+                    INSERT INTO transacciones (usuario, tipo, monto, moneda, medio, banco, descripcion)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (self.current_user["username"], tipo, monto, moneda, medio, banco, descripcion))
                 log_change(self.current_user["username"], "insert", "transacciones", DB.execute("SELECT last_insert_rowid()").fetchone()[0], descripcion)
                 messagebox.showinfo("Éxito", "Transacción registrada")
                 load_transactions()
                 # Limpiar
                 monto_entry.delete(0, END)
                 descripcion_entry.delete(0, END)
-                banco_ven_entry.delete(0, END)
-                banco_ven_entry.insert(0, "0")
-                banco_merc_entry.delete(0, END)
-                banco_merc_entry.insert(0, "0")
-                banco_ban_entry.delete(0, END)
-                banco_ban_entry.insert(0, "0")
 
         def delete_transaction():
             selected = tree.selection()
@@ -532,7 +619,7 @@ class App(Tk):
                 return
             tid = tree.item(selected[0])["values"][0]
             if self.current_user and messagebox.askyesno("Confirmar", "¿Eliminar transacción seleccionada?"):
-                DB.execute("DELETE FROM transacciones WHERE id = ?", (tid,))
+                DB.execute("UPDATE transacciones SET eliminado = 1 WHERE id = ?", (tid,))
                 log_change(self.current_user["username"], "delete", "transacciones", tid, "Eliminada desde interfaz")
                 load_transactions()
 
