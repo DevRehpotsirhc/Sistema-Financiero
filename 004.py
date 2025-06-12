@@ -74,7 +74,7 @@ def init_db():
         monto REAL NOT NULL,
         moneda TEXT NOT NULL CHECK(moneda IN ('Bs','USD')),
         medio TEXT NOT NULL CHECK(medio IN ('fisico','digital')),
-        banco TEXT NOT NULL CHECK(banco IN ('ven', 'mercantil', 'banesco')) DEFAULT 'ven',
+        banco TEXT NULL CHECK(banco IN ('ninguno','ven', 'mercantil', 'banesco')) DEFAULT 'ven',
         descripcion TEXT,
         eliminado INTEGER DEFAULT 0,
         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
