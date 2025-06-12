@@ -8,6 +8,8 @@ from hashlib import sha256
 from tkinter import * # type: ignore
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from fpdf import FPDF
+from tkcalendar import DateEntry
+
 
 # ----------------------------------------------
 # CONFIGURACIÓN
@@ -177,11 +179,7 @@ def generate_pdf_report(username, filename="reporte_financiero.pdf"):
 
     total_entrada = entradas[0]["total"] or 0
     total_salida = salidas[0]["total"] or 0
-    balance = total_entrada - total_salida
 
-    pdf.cell(0, 10, f"Total Entradas: {total_entrada:.2f}", ln=1)
-    pdf.cell(0, 10, f"Total Salidas: {total_salida:.2f}", ln=1)
-    pdf.cell(0, 10, f"Balance Neto: {balance:.2f}", ln=1)
     pdf.ln(10)
 
     pdf.cell(0, 10, "Balance detallado por banco y moneda:", ln=1)
@@ -212,13 +210,25 @@ def generate_pdf_report(username, filename="reporte_financiero.pdf"):
         pdf.ln(3)
 
     # Balance total general por moneda
+
+    # Bs
     total_bs = DB.query("SELECT SUM(CASE WHEN tipo='entrada' THEN monto ELSE -monto END) as total FROM transacciones WHERE eliminado = 0 AND moneda = 'Bs'")[0]["total"] or 0
+    cxc_bs = DB.query("SELECT SUM(monto) as total FROM cuentas_por_cobrar WHERE estado = 'pagada' AND moneda = 'Bs'")[0]["total"] or 0
+    cxp_bs = DB.query("SELECT SUM(monto) as total FROM cuentas_por_pagar WHERE estado = 'pagada' AND moneda = 'Bs'")[0]["total"] or 0
+    balance_bs = total_bs + cxc_bs - cxp_bs
+
+    # USD
     total_usd = DB.query("SELECT SUM(CASE WHEN tipo='entrada' THEN monto ELSE -monto END) as total FROM transacciones WHERE eliminado = 0 AND moneda = 'USD'")[0]["total"] or 0
+    cxc_usd = DB.query("SELECT SUM(monto) as total FROM cuentas_por_cobrar WHERE estado = 'pagada' AND moneda = 'USD'")[0]["total"] or 0
+    cxp_usd = DB.query("SELECT SUM(monto) as total FROM cuentas_por_pagar WHERE estado = 'pagada' AND moneda = 'USD'")[0]["total"] or 0
+    balance_usd = total_usd + cxc_usd - cxp_usd
 
     pdf.ln(5)
     pdf.cell(0, 10, f"Balance Total General:", ln=1)
-    pdf.cell(0, 8, f" - En Bs: {total_bs:.2f}", ln=1)
-    pdf.cell(0, 8, f" - En USD: {total_usd:.2f}", ln=1)
+    pdf.cell(0, 8, f" - En Bs: {balance_bs:.2f}", ln=1)
+    pdf.cell(0, 8, f" - En USD: {balance_usd:.2f}", ln=1)
+    pdf.ln(5)
+
     # Cuentas por cobrar
     pdf.cell(0, 10, "Cuentas por Cobrar:", ln=1)
     cxc = DB.query("SELECT * FROM cuentas_por_cobrar ORDER BY fecha_vencimiento")
@@ -422,6 +432,12 @@ class App(Tk):
         tab_control.add(tab_reportes, text="Reportes")
         self.build_tab_reportes(tab_reportes)
 
+        # Pestaña comparativo
+        if self.current_user and self.current_user["tipo"] == "master":
+            tab_comparativo = Frame(tab_control)
+            tab_control.add(tab_comparativo, text="Comparativo")
+            self.build_tab_comparativo(tab_comparativo)
+
     def logout(self):
         if messagebox.askyesno("Cerrar Sesión", "¿Desea cerrar sesión?"):
             self.current_user = None
@@ -503,6 +519,7 @@ class App(Tk):
 
     def build_tab_transacciones(self, container):
         banco_labels = {
+            "ninguno": "",
             "ven": "Venezuela",
             "mercantil": "Mercantil",
             "banesco": "Banesco"
@@ -538,13 +555,30 @@ class App(Tk):
 
         Label(frm_top, text="Banco:").grid(row=0, column=8)
         banco_display = list(banco_labels.values())
-        banco_var = StringVar(value=banco_display[0])
-        ttk.Combobox(frm_top, textvariable=banco_var, values=banco_display, state="readonly", width=12).grid(row=0, column=9)
+        banco_var = StringVar(value="")
+        banco_cb = ttk.Combobox(frm_top, textvariable=banco_var, values=banco_display, state="readonly", width=12)
+        banco_cb.grid(row=0, column=9)
+
+        def on_medio_change(*args):
+            if medio_var.get() == "fisico":
+                banco_var.set("")
+                banco_cb.config(state="disabled")
+            else:
+                banco_cb.config(state="readonly")
+
+        medio_var.trace_add("write", on_medio_change)
+        on_medio_change()
 
 
         Label(frm_top, text="Descripción:").grid(row=1, column=6)
         descripcion_entry = Entry(frm_top, width=25)
         descripcion_entry.grid(row=1, column=7)
+
+        Label(frm_top, text="Fecha:").grid(row=1, column=8)
+        fecha_entry = DateEntry(frm_top, width=12, date_pattern="dd/mm/yyyy", 
+                                maxdate=datetime.now().date())
+        fecha_entry.set_date(datetime.now().date())
+        fecha_entry.grid(row=1, column=9)
 
         # Tabla
         cols = ("ID", "Usuario", "Tipo", "Monto", "Moneda", "Medio", "Banco", "Descripción", "Fecha")
@@ -598,10 +632,11 @@ class App(Tk):
             banco_nombre = banco_var.get()
             banco = [k for k, v in banco_labels.items() if v == banco_nombre][0]
             if self.current_user:
+                fecha_seleccionada = fecha_entry.get_date()
                 DB.execute("""
-                    INSERT INTO transacciones (usuario, tipo, monto, moneda, medio, banco, descripcion)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (self.current_user["username"], tipo, monto, moneda, medio, banco, descripcion))
+                    INSERT INTO transacciones (usuario, tipo, monto, moneda, medio, banco, descripcion, fecha)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (self.current_user["username"], tipo, monto, moneda, medio, banco, descripcion, fecha_seleccionada))
                 log_change(self.current_user["username"], "insert", "transacciones", DB.execute("SELECT last_insert_rowid()").fetchone()[0], descripcion)
                 messagebox.showinfo("Éxito", "Transacción registrada")
                 load_transactions()
@@ -624,7 +659,8 @@ class App(Tk):
                 load_transactions()
 
         Button(frm_buttons, text="Agregar", command=add_transaction).pack(side=LEFT, padx=5)
-        Button(frm_buttons, text="Eliminar", command=delete_transaction).pack(side=LEFT, padx=5)
+        if self.current_user and self.current_user["tipo"] == "master":
+            Button(frm_buttons, text="Eliminar", command=delete_transaction).pack(side=LEFT, padx=5)
 
         load_transactions()
 
@@ -899,6 +935,50 @@ class App(Tk):
             messagebox.showerror("Backup", f"Error al hacer backup:\n{msg}")
 
 # ------------------------------
+#COMPARATIVO POR FECHA 
+    def build_tab_comparativo(self, container):
+        frm_top = Frame(container)
+        frm_top.pack(pady=10)
+
+        frm_texto = Frame(container)
+        frm_texto.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        texto = Text(frm_texto, height=20, font=("Courier", 10))
+        texto.pack(side=LEFT, fill=BOTH, expand=True)
+
+        scroll = Scrollbar(frm_texto, command=texto.yview)
+        scroll.pack(side=RIGHT, fill=Y)
+        texto.config(yscrollcommand=scroll.set)
+
+        def calcular_comparativo():
+            hoy = datetime.now().date()
+            hace_7 = hoy - timedelta(days=7)
+            hace_30 = hoy - timedelta(days=30)
+
+            def obtener_balance(moneda, desde):
+                res = DB.query("""
+                    SELECT SUM(CASE WHEN tipo='entrada' THEN monto ELSE -monto END) as balance
+                    FROM transacciones
+                    WHERE eliminado = 0 AND moneda = ? AND date(fecha) >= ?
+                """, (moneda, str(desde)))
+                return res[0]["balance"] or 0
+
+            texto.delete(1.0, END)
+            texto.insert(END, "=== COMPARATIVO DE BALANCES ===\n\n")
+
+            for moneda in ["Bs", "USD"]:
+                texto.insert(END, f"Moneda: {moneda}\n")
+                dia = obtener_balance(moneda, hoy)
+                semana = obtener_balance(moneda, hace_7)
+                mes = obtener_balance(moneda, hace_30)
+                texto.insert(END, f"  ➤ Hoy: {dia:.2f}\n")
+                texto.insert(END, f"  ➤ Últimos 7 días: {semana:.2f}\n")
+                texto.insert(END, f"  ➤ Últimos 30 días: {mes:.2f}\n\n")
+
+        Button(frm_top, text="Actualizar Comparativo", command=calcular_comparativo).pack()
+        calcular_comparativo()
+
+        
 # EJECUCIÓN
 
 if __name__ == "__main__":
