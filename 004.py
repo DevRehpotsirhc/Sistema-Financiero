@@ -603,14 +603,22 @@ class App(Tk):
 
             total_entrada = entradas[0]["total"] or 0
             total_salida = salidas[0]["total"] or 0
-            # Balance por moneda
-            entradas_bs = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada' AND eliminado = 0 AND moneda='Bs'")[0]["total"] or 0
-            salidas_bs = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida' AND eliminado = 0 AND moneda='Bs'")[0]["total"] or 0
-            balance_bs = entradas_bs - salidas_bs
 
-            entradas_usd = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='entrada' AND eliminado = 0 AND moneda='USD'")[0]["total"] or 0
-            salidas_usd = DB.query("SELECT SUM(monto) as total FROM transacciones WHERE tipo='salida' AND eliminado = 0 AND moneda='USD'")[0]["total"] or 0
-            balance_usd = entradas_usd - salidas_usd
+            # Balance por moneda añadiendo CXC y CXP
+
+            # Bs
+            entradas_bs = DB.query("SELECT SUM(monto) FROM transacciones WHERE tipo='entrada' AND eliminado=0 AND moneda='Bs'")[0][0] or 0
+            salidas_bs = DB.query("SELECT SUM(monto) FROM transacciones WHERE tipo='salida' AND eliminado=0 AND moneda='Bs'")[0][0] or 0
+            cxc_bs = DB.query("SELECT SUM(monto) FROM cuentas_por_cobrar WHERE estado='pagada' AND moneda='Bs'")[0][0] or 0
+            cxp_bs = DB.query("SELECT SUM(monto) FROM cuentas_por_pagar WHERE estado='pagada' AND moneda='Bs'")[0][0] or 0
+            balance_bs = entradas_bs - salidas_bs + cxc_bs - cxp_bs
+
+            # USD
+            entradas_usd = DB.query("SELECT SUM(monto) FROM transacciones WHERE tipo='entrada' AND eliminado=0 AND moneda='USD'")[0][0] or 0
+            salidas_usd = DB.query("SELECT SUM(monto) FROM transacciones WHERE tipo='salida' AND eliminado=0 AND moneda='USD'")[0][0] or 0
+            cxc_usd = DB.query("SELECT SUM(monto) FROM cuentas_por_cobrar WHERE estado='pagada' AND moneda='USD'")[0][0] or 0
+            cxp_usd = DB.query("SELECT SUM(monto) FROM cuentas_por_pagar WHERE estado='pagada' AND moneda='USD'")[0][0] or 0
+            balance_usd = entradas_usd - salidas_usd + cxc_usd - cxp_usd
 
             balance_label.config(text=f"Balance Bs: {balance_bs:.2f} | USD: {balance_usd:.2f}")
 
@@ -750,11 +758,13 @@ class App(Tk):
             DB.execute("UPDATE cuentas_por_cobrar SET estado = 'pagada' WHERE id = ?", (cid,))
             messagebox.showinfo("Éxito", "Cuenta por cobrar marcada como pagada")
             load_cxc()
+            self.create_main_screen()
 
         Button(frm_buttons, text="Agregar", command=add_cxc).pack(side=LEFT, padx=5)
         Button(frm_buttons, text="Marcar como Pagada", command=mark_paid_cxc).pack(side=LEFT, padx=5)
 
         load_cxc()
+         
 
     # ---------------------
     # CUENTAS POR PAGAR
@@ -842,6 +852,7 @@ class App(Tk):
             DB.execute("UPDATE cuentas_por_pagar SET estado = 'pagada' WHERE id = ?", (cid,))
             messagebox.showinfo("Éxito", "Cuenta por pagar marcada como pagada")
             load_cxp()
+            self.create_main_screen()
 
         Button(frm_buttons, text="Agregar", command=add_cxp).pack(side=LEFT, padx=5)
         Button(frm_buttons, text="Marcar como Pagada", command=mark_paid_cxp).pack(side=LEFT, padx=5)
