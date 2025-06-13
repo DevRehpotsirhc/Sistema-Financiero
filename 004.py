@@ -182,34 +182,56 @@ def generate_pdf_report(username, filename="reporte_financiero.pdf"):
 
     pdf.ln(10)
 
-    pdf.cell(0, 10, "Balance detallado por banco y moneda:", ln=1)
+    pdf.cell(0, 10, "Balance Detallado por Banco:", ln=1)
     bancos = ['ven', 'mercantil', 'banesco']
     monedas = ['Bs', 'USD']
 
+    pdf.cell(0, 10, "Transacciones Bancarias:", ln=1)
+    pdf.cell(0, 8, "Moneda: Bs", ln=1)
+    total_moneda = 0
+    for banco in bancos:
+        entradas = DB.query("""
+            SELECT SUM(monto) as total FROM transacciones
+            WHERE tipo='entrada' AND eliminado = 0 AND moneda='Bs' AND medio='digital' AND banco=?
+        """, (banco,))
+        salidas = DB.query("""
+            SELECT SUM(monto) as total FROM transacciones
+            WHERE tipo='salida' AND eliminado = 0 AND moneda='Bs' AND medio='digital' AND banco=?
+        """, (banco,))
+
+        total_entrada = entradas[0]["total"] or 0
+        total_salida = salidas[0]["total"] or 0
+        balance_banco = total_entrada - total_salida
+        total_moneda += balance_banco
+
+        pdf.cell(0, 8, f" - {banco.capitalize()}:", ln=1)
+        pdf.cell(0, 8, f"    Entradas: {total_entrada:.2f}", ln=1)
+        pdf.cell(0, 8, f"    Salidas: {total_salida:.2f}", ln=1)
+        pdf.cell(0, 8, f"    Balance: {balance_banco:.2f}", ln=1)
+
+    pdf.cell(0, 8, f"Total Bs: {total_moneda:.2f}", ln=1)
+    pdf.ln(5)
+
+
+    # Transacciones físicas por moneda
+    pdf.ln(5)
+    pdf.cell(0, 10, "Transacciones Físicas por Moneda:", ln=1)
     for moneda in monedas:
         pdf.cell(0, 10, f"Moneda: {moneda}", ln=1)
-        total_moneda = 0
-        for banco in bancos:
-            entradas = DB.query("""
-                SELECT SUM(monto) as total FROM transacciones
-                WHERE tipo='entrada' AND eliminado = 0 AND moneda=? AND banco=?
-            """, (moneda, banco))
-            salidas = DB.query("""
-                SELECT SUM(monto) as total FROM transacciones
-                WHERE tipo='salida' AND eliminado = 0 AND moneda=? AND banco=?
-            """, (moneda, banco))
-
-            total_entrada = entradas[0]["total"] or 0
-            total_salida = salidas[0]["total"] or 0
-            balance_banco = total_entrada - total_salida
-            total_moneda += balance_banco
-
-            pdf.cell(0, 8, f" - {banco.capitalize()}: {balance_banco:.2f}", ln=1)
-
-        pdf.cell(0, 8, f"Total {moneda}: {total_moneda:.2f}", ln=1)
-        pdf.ln(3)
-
-    # Balance total general por moneda
+        entradas = DB.query("""
+            SELECT SUM(monto) as total FROM transacciones
+            WHERE tipo='entrada' AND eliminado = 0 AND moneda=? AND medio='fisico'
+        """, (moneda,))
+        salidas = DB.query("""
+            SELECT SUM(monto) as total FROM transacciones
+            WHERE tipo='salida' AND eliminado = 0 AND moneda=? AND medio='fisico'
+        """, (moneda,))
+        total_entrada = entradas[0]["total"] or 0
+        total_salida = salidas[0]["total"] or 0
+        balance = total_entrada - total_salida
+        pdf.cell(0, 8, f"    Entradas: {total_entrada:.2f}", ln=1)
+        pdf.cell(0, 8, f"    Salidas: {total_salida:.2f}", ln=1)
+        pdf.cell(0, 8, f"    Balance: {balance:.2f}", ln=1)
 
     # Bs
     total_bs = DB.query("SELECT SUM(CASE WHEN tipo='entrada' THEN monto ELSE -monto END) as total FROM transacciones WHERE eliminado = 0 AND moneda = 'Bs'")[0]["total"] or 0
@@ -549,9 +571,27 @@ class App(Tk):
         moneda_var = StringVar(value="Bs")
         ttk.Combobox(frm_top, textvariable=moneda_var, values=["Bs", "USD"], state="readonly", width=5).grid(row=0, column=5)
 
+        def on_medio_change(*args):
+            if moneda_var.get() == "USD":
+                medio_var.set("fisico")
+                banco_var.set("")
+                banco_cb.config(state="disabled")
+                medio_menu.config(state="disabled")
+            else:
+                medio_menu.config(state="readonly")
+                if medio_var.get() == "fisico":
+                    banco_var.set("")
+                    banco_cb.config(state="disabled")
+                else:
+                    banco_cb.config(state="readonly")
+        
         Label(frm_top, text="Medio:").grid(row=0, column=6)
         medio_var = StringVar(value="fisico")
-        ttk.Combobox(frm_top, textvariable=medio_var, values=["fisico", "digital"], state="readonly", width=7).grid(row=0, column=7)
+        medio_menu = ttk.Combobox(frm_top, textvariable=medio_var, values=["fisico", "digital"], state="readonly", width=7)
+        medio_menu.grid(row=0, column=7)
+
+        moneda_var.trace_add("write", on_medio_change)
+        medio_var.trace_add("write", on_medio_change)
 
         Label(frm_top, text="Banco:").grid(row=0, column=8)
         banco_display = list(banco_labels.values())
@@ -559,16 +599,8 @@ class App(Tk):
         banco_cb = ttk.Combobox(frm_top, textvariable=banco_var, values=banco_display, state="readonly", width=12)
         banco_cb.grid(row=0, column=9)
 
-        def on_medio_change(*args):
-            if medio_var.get() == "fisico":
-                banco_var.set("")
-                banco_cb.config(state="disabled")
-            else:
-                banco_cb.config(state="readonly")
-
         medio_var.trace_add("write", on_medio_change)
         on_medio_change()
-
 
         Label(frm_top, text="Descripción:").grid(row=1, column=6)
         descripcion_entry = Entry(frm_top, width=25)
@@ -633,6 +665,12 @@ class App(Tk):
             moneda = moneda_var.get()
             medio = medio_var.get()
             descripcion = descripcion_entry.get().strip()
+            if medio == "fisico" and banco_var.get() not in ["", "Ninguno", "ninguno"]:
+                messagebox.showerror("Error", "Las transacciones físicas no deben tener banco asociado")
+                return
+            if moneda == "USD" and medio != "fisico":
+                messagebox.showerror("Error", "Las transacciones en USD solo pueden ser en físico")
+                return
             if monto <= 0:
                 messagebox.showwarning("Error", "El monto debe ser mayor a cero")
                 return
